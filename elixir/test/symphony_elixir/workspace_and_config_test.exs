@@ -386,6 +386,48 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert Enum.map(merged, & &1.identifier) == ["MT-1", "MT-2", "MT-3"]
   end
 
+  test "linear client fetches candidate issues across multiple project slugs" do
+    project_slugs = ["alpha", "beta"]
+
+    graphql_fun = fn query, variables ->
+      send(self(), {:fetch_by_state_page, query, variables})
+
+      project_slug = variables.projectSlug
+
+      body = %{
+        "data" => %{
+          "issues" => %{
+            "nodes" => [
+              %{
+                "id" => "#{project_slug}-issue",
+                "identifier" => String.upcase(project_slug),
+                "title" => "Issue in #{project_slug}",
+                "description" => "Description",
+                "state" => %{"name" => "Todo"},
+                "labels" => %{"nodes" => []},
+                "inverseRelations" => %{"nodes" => []}
+              }
+            ],
+            "pageInfo" => %{"hasNextPage" => false, "endCursor" => nil}
+          }
+        }
+      }
+
+      {:ok, body}
+    end
+
+    assert {:ok, issues} =
+             Client.fetch_issues_by_projects_and_states_for_test(project_slugs, ["Todo"], graphql_fun)
+
+    assert Enum.map(issues, & &1.id) == ["alpha-issue", "beta-issue"]
+
+    assert_receive {:fetch_by_state_page, query, %{projectSlug: "alpha", stateNames: ["Todo"], first: 50, relationFirst: 50, after: nil}}
+    assert query =~ "SymphonyLinearPoll"
+    assert query =~ "slugId: {eq: $projectSlug}"
+
+    assert_receive {:fetch_by_state_page, ^query, %{projectSlug: "beta", stateNames: ["Todo"], first: 50, relationFirst: 50, after: nil}}
+  end
+
   test "linear client paginates issue state fetches by id beyond one page" do
     issue_ids = Enum.map(1..55, &"issue-#{&1}")
     first_batch_ids = Enum.take(issue_ids, 50)
@@ -516,6 +558,78 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     refute Orchestrator.should_dispatch_issue_for_test(issue, state)
   end
 
+  test "todo issue without configured required labels is not dispatch-eligible" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_required_labels_by_state: %{Todo: ["ready-for-agent"]}
+    )
+
+    state = %Orchestrator.State{
+      max_concurrent_agents: 3,
+      running: %{},
+      claimed: MapSet.new(),
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+      retry_attempts: %{}
+    }
+
+    issue = %Issue{
+      id: "unready-todo-1",
+      identifier: "MT-1008",
+      title: "Unready todo work",
+      state: "Todo",
+      labels: []
+    }
+
+    refute Orchestrator.should_dispatch_issue_for_test(issue, state)
+  end
+
+  test "todo issue with configured required labels is dispatch-eligible" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_required_labels_by_state: %{Todo: ["ready-for-agent"]}
+    )
+
+    state = %Orchestrator.State{
+      max_concurrent_agents: 3,
+      running: %{},
+      claimed: MapSet.new(),
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+      retry_attempts: %{}
+    }
+
+    issue = %Issue{
+      id: "ready-todo-1",
+      identifier: "MT-1009",
+      title: "Ready todo work",
+      state: "Todo",
+      labels: ["Ready-For-Agent"]
+    }
+
+    assert Orchestrator.should_dispatch_issue_for_test(issue, state)
+  end
+
+  test "state label requirements do not block other states" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_required_labels_by_state: %{Todo: ["ready-for-agent"]}
+    )
+
+    state = %Orchestrator.State{
+      max_concurrent_agents: 3,
+      running: %{},
+      claimed: MapSet.new(),
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+      retry_attempts: %{}
+    }
+
+    issue = %Issue{
+      id: "progress-1",
+      identifier: "MT-1010",
+      title: "Already in progress",
+      state: "In Progress",
+      labels: []
+    }
+
+    assert Orchestrator.should_dispatch_issue_for_test(issue, state)
+  end
+
   test "issue assigned to another worker is not dispatch-eligible" do
     write_workflow_file!(Workflow.workflow_file_path(), tracker_assignee: "dev@example.com")
 
@@ -582,6 +696,68 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
     assert skipped_issue.identifier == "MT-1005"
     assert skipped_issue.blocked_by == [%{id: "blocker-3", identifier: "MT-1006", state: "In Progress"}]
+  end
+
+  test "dispatch revalidation skips todo issue once required label is removed" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_required_labels_by_state: %{Todo: ["ready-for-agent"]}
+    )
+
+    stale_issue = %Issue{
+      id: "unready-2",
+      identifier: "MT-1011",
+      title: "Stale ready work",
+      state: "Todo",
+      labels: ["ready-for-agent"]
+    }
+
+    refreshed_issue = %Issue{
+      id: "unready-2",
+      identifier: "MT-1011",
+      title: "Stale ready work",
+      state: "Todo",
+      labels: []
+    }
+
+    fetcher = fn ["unready-2"] -> {:ok, [refreshed_issue]} end
+
+    assert {:skip, %Issue{} = skipped_issue} =
+             Orchestrator.revalidate_issue_for_dispatch_for_test(stale_issue, fetcher)
+
+    assert skipped_issue.identifier == "MT-1011"
+    assert skipped_issue.labels == []
+  end
+
+  test "dispatch claim moves todo issue to in progress before agent spawn" do
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory")
+    Application.put_env(:symphony_elixir, :memory_tracker_recipient, self())
+
+    issue = %Issue{
+      id: "claim-1",
+      identifier: "MT-1012",
+      title: "Claim ready work",
+      state: "Todo"
+    }
+
+    assert {:ok, claimed_issue} = Orchestrator.claim_issue_for_dispatch_for_test(issue)
+    assert claimed_issue.state == "In Progress"
+    assert_receive {:memory_tracker_state_update, "claim-1", "In Progress"}
+  end
+
+  test "dispatch claim does not move issue that is already active" do
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory")
+    Application.put_env(:symphony_elixir, :memory_tracker_recipient, self())
+
+    issue = %Issue{
+      id: "claim-2",
+      identifier: "MT-1013",
+      title: "Continue active work",
+      state: "Rework"
+    }
+
+    assert {:ok, claimed_issue} = Orchestrator.claim_issue_for_dispatch_for_test(issue)
+    assert claimed_issue.state == "Rework"
+    refute_receive {:memory_tracker_state_update, "claim-2", _state}
   end
 
   test "workspace remove returns error information for missing directory" do
@@ -741,6 +917,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert config.tracker.endpoint == "https://api.linear.app/graphql"
     assert config.tracker.api_key == nil
     assert config.tracker.project_slug == nil
+    assert config.tracker.project_slugs == []
     assert config.workspace.root == Path.join(System.tmp_dir!(), "symphony_workspaces")
     assert config.worker.max_concurrent_agents_per_host == nil
     assert config.agent.max_concurrent_agents == 10

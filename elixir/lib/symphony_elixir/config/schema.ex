@@ -41,6 +41,7 @@ defmodule SymphonyElixir.Config.Schema do
     @moduledoc false
     use Ecto.Schema
     import Ecto.Changeset
+    alias SymphonyElixir.Config.Schema
 
     @primary_key false
 
@@ -49,8 +50,10 @@ defmodule SymphonyElixir.Config.Schema do
       field(:endpoint, :string, default: "https://api.linear.app/graphql")
       field(:api_key, :string)
       field(:project_slug, :string)
+      field(:project_slugs, {:array, :string}, default: [])
       field(:assignee, :string)
       field(:active_states, {:array, :string}, default: ["Todo", "In Progress"])
+      field(:required_labels_by_state, :map, default: %{})
       field(:terminal_states, {:array, :string}, default: ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"])
     end
 
@@ -59,9 +62,22 @@ defmodule SymphonyElixir.Config.Schema do
       schema
       |> cast(
         attrs,
-        [:kind, :endpoint, :api_key, :project_slug, :assignee, :active_states, :terminal_states],
+        [
+          :kind,
+          :endpoint,
+          :api_key,
+          :project_slug,
+          :project_slugs,
+          :assignee,
+          :active_states,
+          :required_labels_by_state,
+          :terminal_states
+        ],
         empty_values: []
       )
+      |> update_change(:project_slugs, &Schema.normalize_project_slugs/1)
+      |> update_change(:required_labels_by_state, &Schema.normalize_required_labels_by_state/1)
+      |> Schema.validate_required_labels_by_state(:required_labels_by_state)
     end
   end
 
@@ -331,6 +347,90 @@ defmodule SymphonyElixir.Config.Schema do
       Map.put(acc, normalize_issue_state(to_string(state_name)), limit)
     end)
   end
+
+  @doc false
+  @spec normalize_required_labels_by_state(nil | map()) :: map()
+  def normalize_required_labels_by_state(nil), do: %{}
+
+  def normalize_required_labels_by_state(requirements) when is_map(requirements) do
+    Enum.reduce(requirements, %{}, fn {state_name, labels}, acc ->
+      Map.put(
+        acc,
+        normalize_issue_state(to_string(state_name)),
+        normalize_required_labels(labels)
+      )
+    end)
+  end
+
+  def normalize_required_labels_by_state(_requirements), do: %{}
+
+  @doc false
+  @spec validate_required_labels_by_state(Ecto.Changeset.t(), atom()) :: Ecto.Changeset.t()
+  def validate_required_labels_by_state(changeset, field) do
+    validate_change(changeset, field, fn ^field, requirements ->
+      Enum.flat_map(requirements, fn {state_name, labels} ->
+        cond do
+          to_string(state_name) == "" ->
+            [{field, "state names must not be blank"}]
+
+          not is_list(labels) or labels == [] ->
+            [{field, "label requirements must be non-empty lists"}]
+
+          Enum.any?(labels, &(not is_binary(&1) or String.trim(&1) == "")) ->
+            [{field, "label names must be non-blank strings"}]
+
+          true ->
+            []
+        end
+      end)
+    end)
+  end
+
+  @doc false
+  @spec tracker_project_slugs(%Tracker{}) :: [String.t()]
+  def tracker_project_slugs(%Tracker{} = tracker) do
+    [normalize_project_slug(tracker.project_slug) | normalize_project_slugs(tracker.project_slugs)]
+    |> Enum.reject(&is_nil/1)
+    |> Enum.uniq()
+  end
+
+  @doc false
+  @spec normalize_project_slugs(nil | [term()]) :: [String.t()]
+  def normalize_project_slugs(nil), do: []
+
+  def normalize_project_slugs(slugs) when is_list(slugs) do
+    slugs
+    |> Enum.map(&normalize_project_slug/1)
+    |> Enum.reject(&is_nil/1)
+    |> Enum.uniq()
+  end
+
+  def normalize_project_slugs(_slugs), do: []
+
+  defp normalize_project_slug(slug) when is_binary(slug) do
+    case String.trim(slug) do
+      "" -> nil
+      normalized -> normalized
+    end
+  end
+
+  defp normalize_project_slug(_slug), do: nil
+
+  defp normalize_required_labels(labels) when is_list(labels) do
+    labels
+    |> Enum.map(&normalize_required_label/1)
+    |> Enum.uniq()
+  end
+
+  defp normalize_required_labels(labels), do: labels
+
+  defp normalize_required_label(label) when is_binary(label) do
+    label
+    |> String.trim()
+    |> String.downcase()
+  end
+
+  defp normalize_required_label(label), do: label
 
   @doc false
   @spec validate_state_limits(Ecto.Changeset.t(), atom()) :: Ecto.Changeset.t()

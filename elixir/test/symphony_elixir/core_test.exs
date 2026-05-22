@@ -1,6 +1,8 @@
 defmodule SymphonyElixir.CoreTest do
   use SymphonyElixir.TestSupport
 
+  alias SymphonyElixir.Config.Schema
+
   test "config defaults and validation checks" do
     write_workflow_file!(Workflow.workflow_file_path(),
       tracker_api_token: nil,
@@ -14,7 +16,9 @@ defmodule SymphonyElixir.CoreTest do
     config = Config.settings!()
     assert config.polling.interval_ms == 30_000
     assert config.tracker.active_states == ["Todo", "In Progress"]
+    assert config.tracker.required_labels_by_state == %{}
     assert config.tracker.terminal_states == ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"]
+    assert config.tracker.project_slugs == []
     assert config.tracker.assignee == nil
     assert config.agent.max_turns == 20
 
@@ -42,11 +46,37 @@ defmodule SymphonyElixir.CoreTest do
     assert message =~ "tracker.active_states"
 
     write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_required_labels_by_state: %{Todo: [" Ready-For-Agent "]}
+    )
+
+    assert Config.settings!().tracker.required_labels_by_state == %{
+             "todo" => ["ready-for-agent"]
+           }
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_required_labels_by_state: %{Todo: []}
+    )
+
+    assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
+    assert message =~ "tracker.required_labels_by_state"
+
+    write_workflow_file!(Workflow.workflow_file_path(),
       tracker_api_token: "token",
       tracker_project_slug: nil
     )
 
     assert {:error, :missing_linear_project_slug} = Config.validate!()
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_api_token: "token",
+      tracker_project_slug: nil,
+      tracker_project_slugs: ["alpha", " beta ", "alpha", ""]
+    )
+
+    assert :ok = Config.validate!()
+    assert Config.settings!().tracker.project_slug == nil
+    assert Config.settings!().tracker.project_slugs == ["alpha", "beta"]
+    assert Schema.tracker_project_slugs(Config.settings!().tracker) == ["alpha", "beta"]
 
     write_workflow_file!(Workflow.workflow_file_path(),
       tracker_project_slug: "project",

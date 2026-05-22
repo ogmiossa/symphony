@@ -7,6 +7,7 @@ defmodule SymphonyElixir.StatusDashboard do
   require Logger
 
   alias SymphonyElixir.{Config, HttpServer}
+  alias SymphonyElixir.Config.Schema
   alias SymphonyElixir.Orchestrator
   alias SymphonyElixirWeb.ObservabilityPubSub
 
@@ -394,12 +395,15 @@ defmodule SymphonyElixir.StatusDashboard do
 
   defp format_project_link_lines do
     project_part =
-      case Config.settings!().tracker.project_slug do
-        project_slug when is_binary(project_slug) and project_slug != "" ->
-          colorize(linear_project_url(project_slug), @ansi_cyan)
-
-        _ ->
+      case Schema.tracker_project_slugs(Config.settings!().tracker) do
+        [] ->
           colorize("n/a", @ansi_gray)
+
+        project_slugs ->
+          project_slugs
+          |> Enum.map(&linear_project_url/1)
+          |> Enum.join(", ")
+          |> colorize(@ansi_cyan)
       end
 
     project_line = colorize("│ Project: ", @ansi_bold) <> project_part

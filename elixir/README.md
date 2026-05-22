@@ -37,8 +37,10 @@ Symphony stops the active agent for that issue and cleans up matching workspaces
    - The `linear` skill expects Symphony's `linear_graphql` app-server tool for raw Linear GraphQL
      operations such as comment editing or upload flows.
 5. Customize the copied `WORKFLOW.md` file for your project.
-   - To get your project's slug, right-click the project and copy its URL. The slug is part of the
+   - To get a project's slug, right-click the project and copy its URL. The slug is part of the
      URL.
+   - Use `tracker.project_slug` for one project, or `tracker.project_slugs` for a list of candidate
+     projects. If both are set, Symphony polls the union of both settings.
    - When creating a workflow based on this repo, note that it depends on non-standard Linear
      issue statuses: "Rework", "Human Review", and "Merging". You can customize them in
      Team Settings → Workflow in Linear.
@@ -90,6 +92,13 @@ Minimal example:
 tracker:
   kind: linear
   project_slug: "..."
+  # Or use multiple candidate projects:
+  # project_slugs:
+  #   - "first-project-slug"
+  #   - "second-project-slug"
+  required_labels_by_state:
+    Todo:
+      - ready-for-agent
 workspace:
   root: ~/code/workspaces
 hooks:
@@ -110,6 +119,10 @@ Title: {{ issue.title }} Body: {{ issue.description }}
 Notes:
 
 - If a value is missing, defaults are used.
+- Use `tracker.required_labels_by_state` to require labels before an issue in a
+  matching state can be dispatched. For example, require `ready-for-agent` on
+  `Todo` while still allowing existing `In Progress` or `Rework` issues to
+  continue.
 - Safer Codex defaults are used when policy fields are omitted:
   - `codex.approval_policy` defaults to `{"reject":{"sandbox_approval":true,"rules":true,"mcp_elicitations":true}}`
   - `codex.thread_sandbox` defaults to `workspace-write`

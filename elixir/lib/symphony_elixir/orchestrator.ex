@@ -12,6 +12,8 @@ defmodule SymphonyElixir.Orchestrator do
 
   @continuation_retry_delay_ms 1_000
   @failure_retry_base_ms 10_000
+  @claim_from_state "Todo"
+  @claim_to_state "In Progress"
   # Slightly above the dashboard render interval so "checking now…" can render.
   @poll_transition_render_delay_ms 20
   @empty_codex_totals %{
@@ -234,7 +236,7 @@ defmodule SymphonyElixir.Orchestrator do
         state
 
       {:error, :missing_linear_project_slug} ->
-        Logger.error("Linear project slug missing in WORKFLOW.md")
+        Logger.error("Linear project slug(s) missing in WORKFLOW.md")
         state
 
       {:error, :missing_tracker_kind} ->
@@ -320,6 +322,10 @@ defmodule SymphonyElixir.Orchestrator do
       when is_function(issue_fetcher, 1) do
     revalidate_issue_for_dispatch(issue, issue_fetcher, terminal_state_set())
   end
+
+  @doc false
+  @spec claim_issue_for_dispatch_for_test(Issue.t()) :: {:ok, Issue.t()} | {:error, term()}
+  def claim_issue_for_dispatch_for_test(%Issue{} = issue), do: claim_issue_for_dispatch(issue)
 
   @doc false
   @spec sort_issues_for_dispatch_for_test([Issue.t()]) :: [Issue.t()]
@@ -601,10 +607,40 @@ defmodule SymphonyElixir.Orchestrator do
        when is_binary(id) and is_binary(identifier) and is_binary(title) and is_binary(state_name) do
     issue_routable_to_worker?(issue) and
       active_issue_state?(state_name, active_states) and
-      !terminal_issue_state?(state_name, terminal_states)
+      !terminal_issue_state?(state_name, terminal_states) and
+      required_labels_for_state_present?(issue)
   end
 
   defp candidate_issue?(_issue, _active_states, _terminal_states), do: false
+
+  defp required_labels_for_state_present?(%Issue{state: state_name, labels: labels}) when is_binary(state_name) do
+    required_labels =
+      Config.settings!().tracker.required_labels_by_state
+      |> Map.get(normalize_issue_state(state_name), [])
+
+    required_labels == [] or
+      MapSet.subset?(MapSet.new(required_labels), normalized_issue_label_set(labels))
+  end
+
+  defp required_labels_for_state_present?(_issue), do: true
+
+  defp normalized_issue_label_set(labels) when is_list(labels) do
+    labels
+    |> Enum.map(&normalize_issue_label/1)
+    |> Enum.reject(&is_nil/1)
+    |> MapSet.new()
+  end
+
+  defp normalized_issue_label_set(_labels), do: MapSet.new()
+
+  defp normalize_issue_label(label) when is_binary(label) do
+    case label |> String.trim() |> String.downcase() do
+      "" -> nil
+      normalized -> normalized
+    end
+  end
+
+  defp normalize_issue_label(_label), do: nil
 
   defp issue_routable_to_worker?(%Issue{assigned_to_worker: assigned_to_worker})
        when is_boolean(assigned_to_worker),
@@ -686,9 +722,34 @@ defmodule SymphonyElixir.Orchestrator do
         state
 
       worker_host ->
-        spawn_issue_on_worker_host(state, issue, attempt, recipient, worker_host)
+        case claim_issue_for_dispatch(issue) do
+          {:ok, claimed_issue} ->
+            spawn_issue_on_worker_host(state, claimed_issue, attempt, recipient, worker_host)
+
+          {:error, reason} ->
+            Logger.warning("Skipping dispatch; failed to claim issue #{issue_context(issue)}: #{inspect(reason)}")
+            state
+        end
     end
   end
+
+  defp claim_issue_for_dispatch(%Issue{id: issue_id, state: state_name} = issue)
+       when is_binary(issue_id) and is_binary(state_name) do
+    if normalize_issue_state(state_name) == normalize_issue_state(@claim_from_state) do
+      case Tracker.update_issue_state(issue_id, @claim_to_state) do
+        :ok ->
+          Logger.info("Claimed issue for agent: #{issue_context(issue)} state=#{inspect(@claim_to_state)}")
+          {:ok, %Issue{issue | state: @claim_to_state}}
+
+        {:error, reason} ->
+          {:error, reason}
+      end
+    else
+      {:ok, issue}
+    end
+  end
+
+  defp claim_issue_for_dispatch(%Issue{} = issue), do: {:ok, issue}
 
   defp spawn_issue_on_worker_host(%State{} = state, issue, attempt, recipient, worker_host) do
     case Task.Supervisor.start_child(SymphonyElixir.TaskSupervisor, fn ->
